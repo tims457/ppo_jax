@@ -1,24 +1,40 @@
-import functools
-from typing import Any, Callable, Tuple, List
-from absl import logging
-import jax
-import jax.random
-import jax.numpy as jnp
-import numpy as np
-import flax
-from flax import linen as nn
-import optax
+# PPO for continuous action space based on example code from Flax
+# https://github.com/google/flax
 
+
+import jax
+import flax
+import time
+import optax
+import distrax
+import functools
+import ml_collections
+
+import jax.random
+import numpy as np
+import jax.numpy as jnp
+
+from absl import logging
+from flax import linen as nn
+from numpy.random import seed
+from datetime import datetime
 from flax.metrics import tensorboard
 from flax.training import checkpoints
-from flax.training.train_state import TrainState
+from flax.core.scope import Collection
 
-import ml_collections
+from typing import Any, Callable, Tuple, List
+from flax.training.train_state import TrainState
 
 import agent
 import models
-# import test_episodes
+import env_utils
+import test_episodes
 # TODO allow discrete and continuous actions
+# TODO fix checkpointing and tensorboard
+# TODO update documentation
+# TODO all input types
+# TODO actor and critic models
+
 
 @jax.jit
 @functools.partial(jax.vmap, in_axes=(1, 1, 1, None, None), out_axes=1)
@@ -28,7 +44,7 @@ def gae_advantages(
     values: np.ndarray,
     discount: float,
     gae_param: float,
-) -> jnp.array :
+) -> jnp.array:
     """Use Generalized Advantage Estimation (GAE) to compute advantages.
 
     As defined by eqs. (11-12) in PPO paper arXiv: 1707.06347. Implementation uses
@@ -48,8 +64,7 @@ def gae_advantages(
     assert rewards.shape[0] + 1 == values.shape[0], (
         "One more value needed; Eq. "
         "(12) in PPO paper requires "
-        "V(s_{t+1}) for delta_t"
-    )
+        "V(s_{t+1}) for delta_t")
     advantages = []
     gae = 0.0
     for t in reversed(range(len(rewards))):
@@ -64,6 +79,7 @@ def gae_advantages(
     return jnp.array(advantages)
 
 
+@functools.partial(jax.jit, static_argnums=(1,))
 def loss_fn(
     params: flax.core.FrozenDict,
     apply_fn: Callable[..., Any],
@@ -71,7 +87,8 @@ def loss_fn(
     clip_param: float,
     vf_coeff: float,
     entropy_coeff: float,
-):
+    key,
+) -> float:
     """Evaluate the loss function.
 
     Compute loss as a sum of three components: the negative of the PPO clipped
@@ -82,7 +99,7 @@ def loss_fn(
         params: the parameters of the actor-critic model
         apply_fn: the actor-critic model's apply function
         minibatch: Tuple of five elements forming one experience batch:
-                states: shape (batch_size, 84, 84, 4)
+                obs: shape (batch_size, 84, 84, 4)
                 actions: shape (batch_size, 84, 84, 4)
                 old_log_probs: shape (batch_size,)
                 returns: shape (batch_size,)
@@ -94,14 +111,21 @@ def loss_fn(
     Returns:
         loss: the PPO loss, scalar quantity
     """
-    states, actions, old_log_probs, returns, advantages = minibatch
-    dist, values = agent.policy_action(apply_fn, params, states)
-    values = values[:, 0]  # Convert shapes: (batch, 1) to (batch, ).
+    obs, actions, old_log_probs, returns, advantages = minibatch
+
+    mus, sigmas, values = agent.policy_action(apply_fn, params, obs)
+    dist = distrax.MultivariateNormalDiag(mus, sigmas)
+    _, log_probs = dist.sample_and_log_prob(seed=key)
     # probs = jnp.exp(log_probs)
+
+    values = values[:, 0]  # Convert shapes: (batch, 1) to (batch, ).
 
     value_loss = jnp.mean(jnp.square(returns - values), axis=0)
 
-    entropy = jnp.sum(-probs * log_probs, axis=1).mean()
+    # https://math.stackexchange.com/questions/2029707/entropy-of-the-multivariate-gaussian
+    # entropy = jnp.sum(-probs * log_probs).mean()
+
+    entropy = dist.entropy().mean()
 
     # log_probs_act_taken = jax.vmap(lambda lp, a: lp[a])(log_probs, actions)
     log_probs_act_taken = dist.log_prob(actions)
@@ -109,17 +133,12 @@ def loss_fn(
     # Advantage normalization (following the OpenAI baselines).
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     pg_loss = ratios * advantages
-    clipped_loss = advantages * jax.lax.clamp(
-        1.0 - clip_param, ratios, 1.0 + clip_param
-    )
+    clipped_loss = advantages * jax.lax.clamp(1.0 - clip_param, ratios,
+                                              1.0 + clip_param)
     ppo_loss = -jnp.mean(jnp.minimum(pg_loss, clipped_loss), axis=0)
 
     return ppo_loss + vf_coeff * value_loss - entropy_coeff * entropy
 
-@functools.partial(jax.jit, static_argnums=0)
-def policy_action(apply_fn: Callable[..., Any], params: flax.core.frozen_dict.FrozenDict, state: np.ndarray) -> Tuple:
-    out = apply_fn({'params': params}, state)
-    return out
 
 @functools.partial(jax.jit, static_argnums=(2,))
 def train_step(
@@ -130,6 +149,7 @@ def train_step(
     clip_param: float,
     vf_coeff: float,
     entropy_coeff: float,
+    key,
 ) -> Tuple:
     """Compilable train step.
 
@@ -139,8 +159,8 @@ def train_step(
     Args:
         state: the train state
         trajectories: Tuple of the following five elements forming the experience:
-                    states: shape (steps_per_agent*num_agents, 84, 84, 4)
-                    actions: shape (steps_per_agent*num_agents, 84, 84, 4)
+                    obs: shape (steps_per_agent*num_agents, obs_size)
+                    actions: shape (steps_per_agent*num_agents, output_size)
                     old_log_probs: shape (steps_per_agent*num_agents, )
                     returns: shape (steps_per_agent*num_agents, )
                     advantages: (steps_per_agent*num_agents, )
@@ -155,24 +175,27 @@ def train_step(
     """
     iterations = trajectories[0].shape[0] // batch_size
     trajectories = jax.tree_map(
-        lambda x: x.reshape((iterations, batch_size) + x.shape[1:]), trajectories
-    )
+        lambda x: x.reshape((iterations, batch_size) + x.shape[1:]),
+        trajectories)
     loss = 0.0
     for batch in zip(*trajectories):
+        key, subkey = jax.random.split(key)
+        # loss_fn(state.params, state.apply_fn, batch, clip_param, vf_coeff,
+        # entropy_coeff, subkey)
         grad_fn = jax.value_and_grad(loss_fn)
-        l, grads = grad_fn(
-            state.params, state.apply_fn, batch, clip_param, vf_coeff, entropy_coeff
-        )
+        l, grads = grad_fn(state.params, state.apply_fn, batch, clip_param,
+                           vf_coeff, entropy_coeff, subkey)
         loss += l
         state = state.apply_gradients(grads=grads)
     return state, loss
 
-# TODO review
+
 def get_experience(
-    state: TrainState,
+    key,
+    train_state: TrainState,
     simulators: List[agent.RemoteSimulator],
     steps_per_actor: int,
-):
+) -> List[List[agent.ExpTuple]]:
     """Collect experience from agents.
 
     Runs `steps_per_actor` time steps of the env for each of the `simulators`.
@@ -180,32 +203,86 @@ def get_experience(
     all_experience = []
     # Range up to steps_per_actor + 1 to get one more value needed for GAE.
     for _ in range(steps_per_actor + 1):
-        sim_states = []
+        key, subkey = jax.random.split(key)
+        all_obs = []
         for sim in simulators:
-            sim_state = sim.conn.recv()
-            sim_states.append(sim_state)
-        sim_states = np.concatenate(sim_states, axis=0)
-        dist, values = agent.policy_action(
-            state.apply_fn, state.params, sim_states,
+            obs = sim.conn.recv()
+            all_obs.append(obs)
+        all_obs = np.concatenate(all_obs, axis=0)
+        mus, sigmas, values = agent.policy_action(
+            train_state.apply_fn,
+            train_state.params,
+            all_obs,
         )
-        dist, values = jax.device_get((dist, values))
-        # probs = np.exp(np.array(log_probs))
-        # probs = dist.probs
+
+        mus, sigmas, values = jax.device_get((mus, sigmas, values))
+        dist = distrax.MultivariateNormalDiag(mus, sigmas)
+        actions = dist.sample(seed=subkey)
+
         for i, sim in enumerate(simulators):
-            probabilities = probs[i]
-            # action = np.random.choice(probs.shape[1], p=probabilities)
-            action = dist.sample(probs.shape[1])
-            sim.conn.send(action)
+            sim.conn.send(actions[i])
         experiences = []
         for i, sim in enumerate(simulators):
-            sim_state, action, reward, done = sim.conn.recv()
+            obs, action, reward, done = sim.conn.recv()
             value = values[i, 0]
-            # log_prob = log_probs[i][action]
             log_prob = dist[i].log_prob(action)
-            sample = agent.ExpTuple(sim_state, action, reward, value, log_prob, done,)
+            sample = agent.ExpTuple(
+                obs,
+                action,
+                reward,
+                value,
+                log_prob,
+                done,
+            )
             experiences.append(sample)
         all_experience.append(experiences)
     return all_experience
+
+
+def get_experience_single(
+    env_name,
+    key,
+    train_state: TrainState,
+    steps_per_actor: int,
+) -> List[List[agent.ExpTuple]]:
+    all_experience = []
+    env = env_utils.create_env(env_name)
+    obs = env.reset()
+
+    # Range up to steps_per_actor + 1 to get one more value needed for GAE.
+    for _ in range(steps_per_actor + 1):
+        key, subkey = jax.random.split(key)
+        mu, sigma, value = agent.policy_action(
+            train_state.apply_fn,
+            train_state.params,
+            obs,
+        )
+
+        # mu, sigma, value = jax.device_get((mu, sigma, value))
+        dist = distrax.MultivariateNormalDiag(mu, sigma)
+
+        action, log_prob = dist.sample_and_log_prob(seed=subkey)
+        action, log_prob, value = jax.device_get((action, log_prob, value))
+
+        next_obs, reward, done, _ = env.step(action.tolist())
+
+        sample = agent.ExpTuple(
+            obs,
+            action,
+            reward,
+            value,
+            log_prob,
+            done,
+        )
+        all_experience.append([sample])
+
+        if done:
+            obs = env.reset()
+        else:
+            obs = next_obs
+
+    return all_experience
+
 
 # TODO review
 def process_experience(
@@ -214,7 +291,9 @@ def process_experience(
     num_agents: int,
     gamma: float,
     lambda_: float,
-):
+    input_dims: Tuple,
+    output_dims: int,
+) -> Tuple:
     """Process experience for training, including advantage estimation.
 
     Args:
@@ -229,8 +308,8 @@ def process_experience(
     """
     exp_dims = (actor_steps, num_agents)
     values_dims = (actor_steps + 1, num_agents)
-    states = np.zeros(exp_dims + obs_shape, dtype=np.float32)
-    actions = np.zeros(exp_dims, dtype=np.int32)
+    obs = np.zeros(exp_dims + input_dims, dtype=np.float32)
+    actions = np.zeros(exp_dims + (output_dims,), dtype=np.float32)
     rewards = np.zeros(exp_dims, dtype=np.float32)
     values = np.zeros(values_dims, dtype=np.float32)
     log_probs = np.zeros(exp_dims, dtype=np.float32)
@@ -238,7 +317,7 @@ def process_experience(
 
     for t in range(len(experience) - 1):  # experience[-1] only for next_values
         for agent_id, exp_agent in enumerate(experience[t]):
-            states[t, agent_id, ...] = exp_agent.state
+            obs[t, agent_id, ...] = exp_agent.state
             actions[t, agent_id] = exp_agent.action
             rewards[t, agent_id] = exp_agent.reward
             values[t, agent_id] = exp_agent.value
@@ -250,24 +329,26 @@ def process_experience(
     advantages = gae_advantages(rewards, dones, values, gamma, lambda_)
     returns = advantages + values[:-1, :]
     # After preprocessing, concatenate data from all agents.
-    # TODO what is this doing?
-    trajectories = (states, actions, log_probs, returns, advantages)
+    trajectories = (obs, actions, log_probs, returns, advantages)
     trajectory_len = num_agents * actor_steps
     trajectories = tuple(
-        map(lambda x: np.reshape(x, (trajectory_len,) + x.shape[2:]), trajectories)
-    )
+        map(lambda x: np.reshape(x, (trajectory_len,) + x.shape[2:]),
+            trajectories))
     return trajectories
 
-# TODO combine with create_train_state?
-@functools.partial(jax.jit, static_argnums=(1,2))
+
+@functools.partial(jax.jit, static_argnums=(1, 2))
 def get_initial_params(key: np.ndarray, model: nn.Module, input_dims: tuple):
-    init_shape = jnp.ones((1,*input_dims), jnp.float32)
+    init_shape = jnp.ones((1, *input_dims), jnp.float32)
     initial_params = model.init(key, init_shape)["params"]
-    return initial_params #TODO return type
+    return initial_params
 
 
 def create_train_state(
-    params, model: nn.Module, config: ml_collections.ConfigDict, train_steps: int,
+    params,
+    model: nn.Module,
+    config: ml_collections.ConfigDict,
+    train_steps: int,
 ) -> TrainState:
     if config.decaying_lr_and_clip_param:
         lr = optax.linear_schedule(
@@ -277,12 +358,20 @@ def create_train_state(
         )
     else:
         lr = config.learning_rate
-    tx = optax.adam(lr)
-    state = TrainState.create(apply_fn=model.apply, params=params, tx=tx,)
-    return state
+    tx = optax.chain(optax.clip(config.clip_grad), optax.adam(lr))
+    train_state = TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+    )
+    return train_state
 
 
-def train(model: models.ActorCritic, config: ml_collections.ConfigDict, model_dir: str):
+def train(
+    model: models.ActorCritic,
+    config: ml_collections.ConfigDict,
+    model_dir: str,
+) -> TrainState:
     """Main training loop.
 
     Args:
@@ -295,61 +384,110 @@ def train(model: models.ActorCritic, config: ml_collections.ConfigDict, model_di
     """
 
     env = config.env
-    simulators = [agent.RemoteSimulator(env) for _ in range(config.num_agents)]
-    summary_writer = tensorboard.SummaryWriter(model_dir)
+    if config.parallel:
+        simulators = [
+            agent.RemoteSimulator(env) for _ in range(config.num_agents)
+        ]
+    summary_writer = tensorboard.SummaryWriter(
+        model_dir + f"_{datetime.now().strftime('%d%b%y_%H.%M')}")
     summary_writer.hparams(dict(config))
-    loop_steps = config.total_steps // (config.num_agents * config.actor_steps)
+    loop_steps = int(config.total_steps //
+                     (config.num_agents * config.actor_steps))
     # train_step does multiple steps per call for better performance
     # compute number of steps per call here to convert between the number of
     # train steps and the inner number of optimizer steps
     iterations_per_step = config.num_agents * config.actor_steps // config.batch_size
 
-    initial_params = get_initial_params(jax.random.PRNGKey(0), model, config.input_dims)
-    state = create_train_state(
+    initial_params = get_initial_params(jax.random.PRNGKey(0), model,
+                                        config.input_dims)
+    train_state = create_train_state(
         initial_params,
         model,
         config,
         loop_steps * config.num_epochs * iterations_per_step,
     )
     del initial_params
-    state = checkpoints.restore_checkpoint(model_dir, state)
-    # number of train iterations done by each train_step
 
-    start_step = int(state.step) // config.num_epochs // iterations_per_step
+    # train_state = checkpoints.restore_checkpoint(model_dir, train_state)
+    # number of train iterations done by each train_step
+    start_step = int(train_state.step // config.num_epochs //
+                     iterations_per_step)
     logging.info("Start training from step: %s", start_step)
+    key = jax.random.PRNGKey(config.seed)
 
     for step in range(start_step, loop_steps):
+        key, subkey = jax.random.split(key)
+
         # Bookkeeping and testing.
-        # if step % config.log_freq == 0:
-        #     score = test_episodes.policy_test(1, state.apply_fn, state.params, env,)
-        #     frames = step * config.num_agents * config.actor_steps
-        #     summary_writer.scalar("game_score", score, frames)
-        #     logging.info(
-        #         "Step %s:\nframes seen %s\nscore %s\n\n", step, frames, score,
-        #     )
+        if step % config.log_freq == 0:
+            score = test_episodes.policy_test(
+                1,
+                train_state.apply_fn,
+                train_state.params,
+                env,
+            )
+            frames = step * config.num_agents * config.actor_steps
+            summary_writer.scalar("game_score", score, int(frames))
+            logging.info(
+                "Step %s:\nsteps seen %s\nscore %s\n\n",
+                step,
+                frames,
+                score,
+            )
 
         # Core training code.
         alpha = 1.0 - step / loop_steps if config.decaying_lr_and_clip_param else 1.0
-        all_experiences = get_experience(state, simulators, config.actor_steps)
+
+        # with jax.profiler.trace(model_dir):
+        # tic = time.perf_counter()
+        if config.parallel:
+            all_experiences = get_experience(subkey, train_state, simulators,
+                                             config.actor_steps)
+        else:
+            all_experiences = get_experience_single(config.env, subkey,
+                                                    train_state,
+                                                    config.actor_steps)
+        # toc = time.perf_counter()
+        # print(f"get experience {toc - tic:0.4f} seconds")
+
+        # tic = time.perf_counter()
         trajectories = process_experience(
             all_experiences,
             config.actor_steps,
             config.num_agents,
             config.gamma,
             config.lambda_,
+            config.input_dims,
+            config.output_dims,
         )
+        # toc = time.perf_counter()
+        # print(f"process experience {toc - tic:0.4f} seconds")
+
         clip_param = config.clip_param * alpha
+        total_loss = 0.0
+        # tic = time.perf_counter()
         for _ in range(config.num_epochs):
-            permutation = np.random.permutation(config.num_agents * config.actor_steps)
+            permutation = np.random.permutation(config.num_agents *
+                                                config.actor_steps)
             trajectories = tuple(x[permutation] for x in trajectories)
-            state, _ = train_step(
-                state,
+            key, subkey = jax.random.split(key)
+            train_state, loss = train_step(
+                train_state,
                 trajectories,
                 config.batch_size,
                 clip_param=clip_param,
                 vf_coeff=config.vf_coeff,
                 entropy_coeff=config.entropy_coeff,
+                key=subkey,
             )
+            total_loss += loss
+        # toc = time.perf_counter()
+        # print(f"train {toc - tic:0.4f} seconds")
+
+        print(f"Step {step} loss: {total_loss:.3f}\t")
+        summary_writer.scalar("loss", total_loss,
+                              step * config.num_agents * config.actor_steps)
+
         if (step + 1) % config.checkpoint_freq == 0:
-            checkpoints.save_checkpoint(model_dir, state, step + 1)
+            checkpoints.save_checkpoint(model_dir, train_state, step + 1)
     return train_state

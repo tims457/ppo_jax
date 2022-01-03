@@ -1,0 +1,5 @@
+launch.json
+*.pyc
+tmp/
+__pycache__/
+cfg/__pycache__/
