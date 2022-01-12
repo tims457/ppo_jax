@@ -1,7 +1,6 @@
 # PPO for continuous action space based on example code from Flax
 # https://github.com/google/flax
 
-
 import jax
 import flax
 import time
@@ -14,30 +13,29 @@ import jax.random
 import numpy as np
 import jax.numpy as jnp
 
+from jax import lax
 from absl import logging
 from flax import linen as nn
-from numpy.random import seed
 from datetime import datetime
 from flax.metrics import tensorboard
 from flax.training import checkpoints
-from flax.core.scope import Collection
 
 from typing import Any, Callable, Tuple, List
 from flax.training.train_state import TrainState
 
-import agent
-import models
 import env_utils
 import test_episodes
+from ppo_jax import agent, train_state
+
 # TODO allow discrete and continuous actions
 # TODO fix checkpointing and tensorboard
 # TODO update documentation
 # TODO all input types
-# TODO actor and critic models
 
 
-@jax.jit
-@functools.partial(jax.vmap, in_axes=(1, 1, 1, None, None), out_axes=1)
+# TODO make this compile faster
+# @jax.jit
+# @functools.partial(jax.vmap, in_axes=(1, 1, 1, None, None), out_axes=1)
 def gae_advantages(
     rewards: np.ndarray,
     terminal_masks: np.ndarray,
@@ -116,7 +114,7 @@ def loss_fn(
     mus, sigmas, values = agent.policy_action(apply_fn, params, obs)
     dist = distrax.MultivariateNormalDiag(mus, sigmas)
     _, log_probs = dist.sample_and_log_prob(seed=key)
-    # probs = jnp.exp(log_probs)
+    probs = jnp.exp(log_probs)
 
     values = values[:, 0]  # Convert shapes: (batch, 1) to (batch, ).
 
@@ -130,6 +128,7 @@ def loss_fn(
     # log_probs_act_taken = jax.vmap(lambda lp, a: lp[a])(log_probs, actions)
     log_probs_act_taken = dist.log_prob(actions)
     ratios = jnp.exp(log_probs_act_taken - old_log_probs)
+    # ratios = jnp.exp(probs - jnp.exp(old_log_probs))
     # Advantage normalization (following the OpenAI baselines).
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     pg_loss = ratios * advantages
@@ -212,7 +211,7 @@ def get_experience(
         mus, sigmas, values = agent.policy_action(
             train_state.apply_fn,
             train_state.params,
-            all_obs,
+            env_utils.scaler(all_obs),
         )
 
         mus, sigmas, values = jax.device_get((mus, sigmas, values))
@@ -240,13 +239,13 @@ def get_experience(
 
 
 def get_experience_single(
-    env_name,
+    config,
     key,
     train_state: TrainState,
     steps_per_actor: int,
 ) -> List[List[agent.ExpTuple]]:
     all_experience = []
-    env = env_utils.create_env(env_name)
+    env = env_utils.create_env(config)
     obs = env.reset()
 
     # Range up to steps_per_actor + 1 to get one more value needed for GAE.
@@ -255,14 +254,15 @@ def get_experience_single(
         mu, sigma, value = agent.policy_action(
             train_state.apply_fn,
             train_state.params,
-            obs,
+            env_utils.scaler(jnp.expand_dims(obs,axis=0)),
         )
 
         # mu, sigma, value = jax.device_get((mu, sigma, value))
         dist = distrax.MultivariateNormalDiag(mu, sigma)
 
         action, log_prob = dist.sample_and_log_prob(seed=subkey)
-        action, log_prob, value = jax.device_get((action, log_prob, value))
+        # action = jnp.array([[0.,1.,0.],[0.,1.,0.]])
+        # action, log_prob, value = jax.device_get((action, log_prob, value))
 
         next_obs, reward, done, _ = env.step(action.tolist())
 
@@ -284,7 +284,55 @@ def get_experience_single(
     return all_experience
 
 
-# TODO review
+# @functools.partial(jax.jit, static_argnums=(0,3))
+# def get_experience_single(
+#     env_name,
+#     key,
+#     train_state: TrainState,
+#     steps_per_actor: int,
+# ) -> List[List[agent.ExpTuple]]:
+#     all_experience = []
+#     env = env_utils.create_env(env_name)
+#     obs = env.reset()
+
+#     def step(obs, env, train_state, key):
+#         key, subkey = jax.random.split(seed=key)
+#         mu, sigma, value = agent.policy_action(
+#             train_state.apply_fn,
+#             train_state.params,
+#             obs,
+#         )
+
+#         # mu, sigma, value = jax.device_get((mu, sigma, value))
+#         dist = distrax.MultivariateNormalDiag(mu, sigma)
+
+#         action, log_prob = dist.sample_and_log_prob(seed=subkey)
+#         action, log_prob, value = jax.device_get((action, log_prob, value))
+
+#         next_obs, reward, done, _ = env.step(action.tolist())
+
+#         sample = agent.ExpTuple(
+#             obs,
+#             action,
+#             reward,
+#             value,
+#             log_prob,
+#             done,
+#         )
+
+#         if done:
+#             obs = env.reset()
+#         else:
+#             obs = next_obs
+
+#         return (next_obs, env, train_state, key), sample
+
+#     _, hist = lax.scan(lambda s,i: step(*s), (obs, env, train_state, key),
+#         jnp.arange(steps_per_actor+1))
+
+#     return hist
+
+
 def process_experience(
     experience: List[List[agent.ExpTuple]],
     actor_steps: int,
@@ -344,6 +392,53 @@ def get_initial_params(key: np.ndarray, model: nn.Module, input_dims: tuple):
     return initial_params
 
 
+@functools.partial(jax.jit, static_argnums=(1, 2, 3))
+def get_initial_params_multi(key: np.ndarray, policy_model: nn.Module,
+                             value_model: nn.Module,
+                             input_dims: tuple) -> Tuple:
+    init_shape = jnp.ones((1, *input_dims), jnp.float32)
+    policy_initial_params = policy_model.init(key, init_shape)["params"]
+    value_initial_params = value_model.init(key, init_shape)["params"]
+    return (policy_initial_params, value_initial_params)
+
+
+def create_train_state_multi(
+    policy_params,
+    value_params,
+    policy_model: nn.Module,
+    value_model: nn.Module,
+    config: ml_collections.ConfigDict,
+    train_steps: int,
+) -> train_state.TrainStateMultiOpt:
+    if config.decaying_lr_and_clip_param:
+
+        policy_lr = optax.linear_schedule(
+            init_value=config.policy_lr,
+            end_value=0.0,
+            transition_steps=train_steps,
+        )
+        value_lr = optax.linear_schedule(
+            init_value=config.value_lr,
+            end_value=0.0,
+            transition_steps=train_steps,
+        )
+    else:
+        policy_lr = config.policy_lr
+        value_lr = config.value_lr
+
+    policy_tx = optax.chain(optax.clip(config.clip_grad), optax.adam(policy_lr))
+    value_tx = optax.chain(optax.clip(config.clip_grad), optax.adam(value_lr))
+    train_state = TrainState.create(
+        policy_apply_fn=policy_model.apply,
+        value_apply_fn=value_model.apply,
+        policy_params=policy_params,
+        value_params=value_params,
+        policy_tx=policy_tx,
+        value_tx=value_tx,
+    )
+    return train_state
+
+
 def create_train_state(
     params,
     model: nn.Module,
@@ -352,13 +447,15 @@ def create_train_state(
 ) -> TrainState:
     if config.decaying_lr_and_clip_param:
         lr = optax.linear_schedule(
-            init_value=config.learning_rate,
+            init_value=config.lr,
             end_value=0.0,
             transition_steps=train_steps,
         )
     else:
-        lr = config.learning_rate
-    tx = optax.chain(optax.clip(config.clip_grad), optax.adam(lr))
+        lr = config.lr
+    # todo try clip by global norm
+    # tx = optax.chain(optax.clip(config.clip_grad), optax.adam(lr))
+    tx = optax.chain(optax.clip_by_global_norm(config.clip_grad), optax.adam(lr))
     train_state = TrainState.create(
         apply_fn=model.apply,
         params=params,
@@ -368,7 +465,9 @@ def create_train_state(
 
 
 def train(
-    model: models.ActorCritic,
+    model: nn.module,
+    # policy_model: models.Actor,
+    # value_model: models.Critic,
     config: ml_collections.ConfigDict,
     model_dir: str,
 ) -> TrainState:
@@ -383,13 +482,14 @@ def train(
         optimizer: the trained optimizer
     """
 
-    env = config.env
-    if config.parallel:
+    # env = config.env
+    if config.num_agents > 1:
         simulators = [
-            agent.RemoteSimulator(env) for _ in range(config.num_agents)
+            agent.RemoteSimulator(config) for _ in range(config.num_agents)
         ]
+    init_time = f"_{datetime.now().strftime('%d%b%y_%H.%M')}"
     summary_writer = tensorboard.SummaryWriter(
-        model_dir + f"_{datetime.now().strftime('%d%b%y_%H.%M')}")
+        model_dir + init_time)
     summary_writer.hparams(dict(config))
     loop_steps = int(config.total_steps //
                      (config.num_agents * config.actor_steps))
@@ -398,15 +498,27 @@ def train(
     # train steps and the inner number of optimizer steps
     iterations_per_step = config.num_agents * config.actor_steps // config.batch_size
 
-    initial_params = get_initial_params(jax.random.PRNGKey(0), model,
-                                        config.input_dims)
+    init_params = get_initial_params(jax.random.PRNGKey(0), model,
+                                     config.input_dims)
+
     train_state = create_train_state(
-        initial_params,
+        init_params,
         model,
         config,
         loop_steps * config.num_epochs * iterations_per_step,
     )
-    del initial_params
+    # init_params  = get_initial_params_multi(jax.random.PRNGKey(0), policy_model, value_model,
+    #                                     config.input_dims)
+
+    # train_state = create_train_state_multi(
+    #     init_params[0],
+    #     init_params[1],
+    #     policy_model,
+    #     value_model,
+    #     config,
+    #     loop_steps * config.num_epochs * iterations_per_step,
+    # )
+    del init_params
 
     # train_state = checkpoints.restore_checkpoint(model_dir, train_state)
     # number of train iterations done by each train_step
@@ -424,7 +536,8 @@ def train(
                 1,
                 train_state.apply_fn,
                 train_state.params,
-                env,
+                step,
+                config,
             )
             frames = step * config.num_agents * config.actor_steps
             summary_writer.scalar("game_score", score, int(frames))
@@ -439,18 +552,18 @@ def train(
         alpha = 1.0 - step / loop_steps if config.decaying_lr_and_clip_param else 1.0
 
         # with jax.profiler.trace(model_dir):
-        # tic = time.perf_counter()
-        if config.parallel:
+        tic = time.perf_counter()
+        if config.num_agents > 1:
             all_experiences = get_experience(subkey, train_state, simulators,
                                              config.actor_steps)
         else:
-            all_experiences = get_experience_single(config.env, subkey,
+            all_experiences = get_experience_single(config, subkey,
                                                     train_state,
                                                     config.actor_steps)
-        # toc = time.perf_counter()
-        # print(f"get experience {toc - tic:0.4f} seconds")
+        toc = time.perf_counter()
+        print(f"get experience {toc - tic:0.4f} seconds")
 
-        # tic = time.perf_counter()
+        tic = time.perf_counter()
         trajectories = process_experience(
             all_experiences,
             config.actor_steps,
@@ -460,12 +573,12 @@ def train(
             config.input_dims,
             config.output_dims,
         )
-        # toc = time.perf_counter()
-        # print(f"process experience {toc - tic:0.4f} seconds")
+        toc = time.perf_counter()
+        print(f"process experience {toc - tic:0.4f} seconds")
 
         clip_param = config.clip_param * alpha
         total_loss = 0.0
-        # tic = time.perf_counter()
+        tic = time.perf_counter()
         for _ in range(config.num_epochs):
             permutation = np.random.permutation(config.num_agents *
                                                 config.actor_steps)
@@ -481,13 +594,13 @@ def train(
                 key=subkey,
             )
             total_loss += loss
-        # toc = time.perf_counter()
-        # print(f"train {toc - tic:0.4f} seconds")
+        toc = time.perf_counter()
+        print(f"train {toc - tic:0.4f} seconds")
 
-        print(f"Step {step} loss: {total_loss:.3f}\t")
+        logging.info("Step %s loss: %.3f\t", step, total_loss)
         summary_writer.scalar("loss", total_loss,
                               step * config.num_agents * config.actor_steps)
 
         if (step + 1) % config.checkpoint_freq == 0:
-            checkpoints.save_checkpoint(model_dir, train_state, step + 1)
+            checkpoints.save_checkpoint(model_dir + init_time + f"_{step+1}", train_state, step + 1)
     return train_state

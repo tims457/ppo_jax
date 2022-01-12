@@ -50,13 +50,13 @@ class RemoteSimulator:
         self.proc.start()
 
 
-def rcv_action_send_exp(conn, env_name: str):
+def rcv_action_send_exp(conn, config):
     """Run the remote agents.
 
   Receive action from the main learner, perform one step of simulation and
   send back collected experience.
   """
-    env = env_utils.create_env(env_name)
+    env = env_utils.create_env(config)
     while True:
         obs = env.reset()
         done = False

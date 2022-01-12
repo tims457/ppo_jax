@@ -25,7 +25,6 @@ def main(argv):
     # Make sure tf does not allocate gpu memory.
     tf.config.experimental.set_visible_devices([], 'GPU')
     config = FLAGS.config
-    env = config.env
     model = models.ActorCritic(layers=config.layers,
                                num_outputs=config.output_dims)
     ppo_lib.train(model, config, FLAGS.workdir)

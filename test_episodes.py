@@ -7,13 +7,11 @@ import distrax
 import numpy as np
 import jax
 
-import env_utils
-import agent
-import models
+from ppo_jax import env_utils, agent
 
 
 def policy_test(n_episodes: int, apply_fn: Callable[..., Any],
-                params: flax.core.frozen_dict.FrozenDict, game: str):
+                params: flax.core.frozen_dict.FrozenDict, step, config):
     """Perform a test of the policy in Atari environment.
 
   Args:
@@ -25,7 +23,7 @@ def policy_test(n_episodes: int, apply_fn: Callable[..., Any],
   Returns:
     total_reward: obtained score
   """
-    test_env = env_utils.create_env(game)
+    test_env = env_utils.create_env(config)
     key = jax.random.PRNGKey(1234)
     for _ in range(n_episodes):
         obs = test_env.reset()
